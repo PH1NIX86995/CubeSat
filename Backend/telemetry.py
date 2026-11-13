@@ -12,11 +12,12 @@ import asyncio
 import time
 import random
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -89,8 +90,24 @@ class TelemetrySimulator:
         self.sun_eclipse_ratio = 0.6  # 60% sun, 40% eclipse
         self.healthy_ranges = HealthyRanges()
         
+        
         # Simulation state
-        self.start_time = time.time()
+        # Beschleunigungsfaktor aus Umgebungsvariable lesen
+        self.simulation_speed = float(os.getenv("SIM_SPEED", "1"))
+
+        if self.simulation_speed <= 0:
+            raise ValueError("SIM_SPEED muss größer als 0 sein")
+
+        # Startpunkt der Simulationsuhr
+        self.start_time = time.monotonic()
+        self.simulation_start = datetime.now(timezone.utc)
+
+        # Zeitpunkt des letzten Simulationsschritts
+        self.last_simulation_time = 0.0
+
+        # Zuletzt generierte Telemetrie
+        self.latest_telemetry = None
+        
         self.current_mode = SatelliteMode.NORMAL
         self.fault_active = False
         self.fault_type = None
@@ -123,6 +140,14 @@ class TelemetrySimulator:
         self.event_log: List[Dict] = []
         
         logger.info(f"Telemetry simulator initialized with {orbital_period_minutes} min orbital period")
+        
+        
+    def get_simulation_time(self):
+        # Vergangene reale Sekunden
+        elapsed_real = time.monotonic() - self.start_time
+
+        # Umrechnung in Simulationssekunden
+        return elapsed_real * self.simulation_speed
     
     def add_telemetry_callback(self, callback: Callable[[TelemetryData], None]):
         """Add a callback function to be called when new telemetry is generated"""
@@ -139,12 +164,12 @@ class TelemetrySimulator:
         self.event_log.append(event)
         logger.info(f"Event: {event_type} - {description}")
     
-    def get_orbital_phase(self) -> float:
-        """
-        Get current orbital phase (0.0 = eclipse start, 0.5 = sun start, 1.0 = eclipse start again)
-        """
-        elapsed = time.time() - self.start_time
+    
+    def get_orbital_phase(self):
+        elapsed = self.get_simulation_time()
+
         phase = (elapsed % self.orbital_period) / self.orbital_period
+
         return phase
     
     def is_in_sunlight(self) -> bool:
@@ -187,30 +212,43 @@ class TelemetrySimulator:
                 alpha = 1 - math.exp(-dt / tau)
                 self.thermal_state[component] = current_temp + alpha * (target_temp - current_temp)
     
-    def generate_radiation_spike(self) -> float:
-        """Generate radiation spike if conditions are met"""
-        current_time = time.time()
-        
-        # Check if we should start a new spike
-        if (self.radiation_spike_start is None and 
-            random.random() < self.radiation_spike_probability):
-            self.radiation_spike_start = current_time
-            self.log_event("RADIATION_SPIKE", "Radiation spike detected", 
-                          {"spike_start": current_time})
-        
-        # Check if we're in an active spike
-        if (self.radiation_spike_start is not None and 
-            current_time - self.radiation_spike_start < self.radiation_spike_duration):
-            # Generate spike with random intensity (10-80 cps)
+    
+    def generate_radiation_spike(self, sim_time: float, dt: float) -> float:
+        """Simuliert Strahlungsspitzen in Simulationszeit."""
+
+        # Prüfen, ob ein bestehendes Ereignis abgelaufen ist
+        if self.radiation_spike_start is not None:
+            elapsed = sim_time - self.radiation_spike_start
+
+            if elapsed < self.radiation_spike_duration:
+                return random.uniform(10.0, 80.0)
+
+            self.log_event(
+                "RADIATION_SPIKE_END",
+                "Radiation spike ended"
+            )
+            self.radiation_spike_start = None
+
+        # Wahrscheinlichkeit für das vergangene Zeitintervall
+        probability = 1 - (
+            1 - self.radiation_spike_probability
+        ) ** dt
+
+        # Neues Strahlungsereignis auslösen
+        if random.random() < probability:
+            self.radiation_spike_start = sim_time
+
+            self.log_event(
+                "RADIATION_SPIKE",
+                "Radiation spike detected",
+                {"spike_start": sim_time}
+            )
+
             return random.uniform(10.0, 80.0)
-        else:
-            # End the spike
-            if self.radiation_spike_start is not None:
-                self.log_event("RADIATION_SPIKE_END", "Radiation spike ended")
-                self.radiation_spike_start = None
-            
-            # Normal radiation levels
-            return random.uniform(0.1, 5.0)
+
+        # Normaler Strahlungswert
+        return random.uniform(0.1, 5.0)
+
     
     def inject_fault(self, fault_type: str, duration: float = 60.0):
         """
@@ -237,7 +275,7 @@ class TelemetrySimulator:
     
     def generate_telemetry(self) -> TelemetryData:
         """Generate a single telemetry data point"""
-        current_time = datetime.now(timezone.utc)
+        current_time = (self.simulation_start + timedelta(seconds=self.get_simulation_time()))
         solar_factor = self.get_solar_irradiance_factor()
         is_sunlight = self.is_in_sunlight()
         
@@ -304,11 +342,21 @@ class TelemetrySimulator:
             'panel_temp_c': target_panel_temp
         }
         
-        # Update thermal state (assuming 1-second update interval)
-        self.update_thermal_state(target_temps, 1.0)
+        
+        # Aktuelle Simulationszeit
+        sim_time = self.get_simulation_time()
+
+        # Zeit seit dem letzten Simulationsschritt
+        dt = max(0.0, sim_time - self.last_simulation_time)
+
+        # Thermischen Zustand aktualisieren
+        self.update_thermal_state(target_temps, dt)
+
+        # Zeitpunkt merken
+        self.last_simulation_time = sim_time
         
         # Generate radiation
-        rad_cps = self.generate_radiation_spike()
+        rad_cps = self.generate_radiation_spike(sim_time, dt)
         
         # Apply fault injection
         fault_injected = False
@@ -355,23 +403,17 @@ class TelemetrySimulator:
             self.log_event("MODE_CHANGE", f"Mode changed from {self.current_mode.value} to {mode.value}")
             self.current_mode = mode
     
+    
     def get_latest_telemetry(self) -> TelemetryData:
-        """Get the latest telemetry data with recovery processing"""
-        # Generate base telemetry
-        telemetry = self.generate_telemetry()
-        
-        # Process through recovery engine if available
-        try:
-            from recovery import get_recovery_engine
-            recovery_engine = get_recovery_engine(self)
-            telemetry = recovery_engine.process_telemetry(telemetry)
-            # Update current mode to match recovery engine
-            self.current_mode = recovery_engine.current_mode
-        except ImportError:
-            # Recovery engine not available, use base telemetry
-            pass
-        
-        return telemetry
+        """Gibt die zuletzt generierten Telemetriedaten zurück."""
+
+        # Prüfen, ob bereits Telemetrie erzeugt wurde
+        if self.latest_telemetry is None:
+            raise RuntimeError("Noch keine Telemetrie vorhanden")
+
+        # Letzten gespeicherten Datensatz zurückgeben
+        return self.latest_telemetry
+
     
     def get_event_log(self, limit: Optional[int] = None) -> List[Dict]:
         """Get the event log, optionally limited to recent entries"""
@@ -449,6 +491,9 @@ async def run_telemetry_stream(update_interval: float = 1.0):
             
             # Update simulator's current mode to match recovery engine
             simulator.current_mode = recovery_engine.current_mode
+            
+            # Aktuellsten verarbeiteten Telemetriedatensatz speichern
+            simulator.latest_telemetry = telemetry
             
             # Call all registered callbacks
             for callback in simulator.telemetry_callbacks:
