@@ -5,9 +5,7 @@ Implements autonomous recovery strategies for CubeSat anomalies.
 Manages mode state machine and applies corrective actions based on detected anomalies.
 """
 
-import asyncio
-import time
-from datetime import datetime, timezone
+from datetime import timedelta
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 from dataclasses import dataclass
@@ -54,7 +52,8 @@ class RecoveryEngine:
         self.current_mode = SatelliteMode.NORMAL
         self.recovery_active = False
         self.recovery_start_time = None
-        self.last_anomaly_check = time.time()
+        self.last_anomaly_check = self.simulator.get_simulation_time()
+        self.normal_transition_time = None
         
         # Recovery strategies for different anomaly types
         self.recovery_strategies = self._initialize_recovery_strategies()
@@ -155,7 +154,8 @@ class RecoveryEngine:
         
         strategy = self.recovery_strategies[anomaly_type]
         
-        # Don't apply recovery if already in the target mode
+        # Bestehende Recovery nicht bei jedem Sample neu starten.
+        # Ausnahme: RECOVERED kann bei neuer Anomalie erneut SAFE werden.
         if self.current_mode == strategy.target_mode:
             logger.debug(f"Already in {strategy.target_mode.value} mode, skipping recovery")
             return False
@@ -166,9 +166,10 @@ class RecoveryEngine:
         for action in strategy.actions:
             self._apply_recovery_action(action, strategy)
         
-        # Set recovery state
+        # Set recovery state (Simulationssekunden)
+        self.normal_transition_time = None
         self.recovery_active = True
-        self.recovery_start_time = time.time()
+        self.recovery_start_time = self.simulator.get_simulation_time()
         self.active_recovery = {
             "strategy": strategy,
             "start_time": self.recovery_start_time,
@@ -241,7 +242,7 @@ class RecoveryEngine:
             return False
         
         # Check if recovery duration has passed
-        recovery_duration = time.time() - self.recovery_start_time
+        recovery_duration = self.simulator.get_simulation_time() - self.recovery_start_time
         strategy = self.active_recovery["strategy"]
         
         if recovery_duration < strategy.recovery_duration:
@@ -258,31 +259,32 @@ class RecoveryEngine:
         return True
     
     def _apply_mode_recovery(self):
-        """Apply mode recovery sequence: SAFE → RECOVERED → NORMAL"""
+        """SAFE -> RECOVERED; NORMAL wird spaeter zeitgesteuert geprueft."""
         if self.current_mode == SatelliteMode.SAFE:
-            # Transition to RECOVERED
-            self.set_mode(SatelliteMode.RECOVERED, "Anomalies cleared, entering recovery phase")
-            
-            # Schedule transition to NORMAL after a delay
-            asyncio.create_task(self._schedule_normal_mode_transition())
-            
-        elif self.current_mode == SatelliteMode.RECOVERED:
-            # This shouldn't happen as we schedule the transition
-            logger.warning("Unexpected RECOVERED mode state")
-    
-    async def _schedule_normal_mode_transition(self):
-        """Schedule transition from RECOVERED to NORMAL mode"""
-        # Wait 30 seconds in RECOVERED mode
-        await asyncio.sleep(30.0)
-        
-        if self.current_mode == SatelliteMode.RECOVERED:
-            self.set_mode(SatelliteMode.NORMAL, "Recovery phase complete, resuming normal operations")
+            self.set_mode(SatelliteMode.RECOVERED,
+                          "Anomalies cleared, entering recovery phase")
+            self.normal_transition_time = (
+                self.simulator.get_simulation_time() + 30.0
+            )
+
+    def update_normal_transition(self, telemetry: TelemetryData):
+        """RECOVERED -> NORMAL nur nach 30 Simulationssekunden ohne Anomalie."""
+        if self.current_mode != SatelliteMode.RECOVERED:
+            return
+        if self.normal_transition_time is None:
+            return
+        if self.simulator.check_anomalies(telemetry):
+            # Neue Anomalie wird oben in process_telemetry behandelt.
+            return
+        if self.simulator.get_simulation_time() >= self.normal_transition_time:
+            self.set_mode(SatelliteMode.NORMAL,
+                          "Recovery phase complete, resuming normal operations")
             self._clear_recovery_state()
-    
+
     def _clear_recovery_state(self):
         """Clear recovery state and return to normal operations"""
         if self.active_recovery:
-            recovery_duration = time.time() - self.recovery_start_time
+            recovery_duration = self.simulator.get_simulation_time() - self.recovery_start_time
             
             self.simulator.log_event(
                 "RECOVERY_COMPLETE",
@@ -296,7 +298,8 @@ class RecoveryEngine:
             
             # Add to recovery history
             self.recovery_history.append({
-                "timestamp": datetime.now(timezone.utc),
+                "timestamp": self.simulator.simulation_start + timedelta(
+                    seconds=self.simulator.get_simulation_time()),
                 "strategy": self.active_recovery["strategy"].anomaly_type,
                 "duration": recovery_duration,
                 "success": True
@@ -305,6 +308,7 @@ class RecoveryEngine:
         self.recovery_active = False
         self.recovery_start_time = None
         self.active_recovery = None
+        self.normal_transition_time = None
     
     def detect_anomaly_type(self, anomalies: List[str]) -> Optional[str]:
         """
@@ -352,9 +356,10 @@ class RecoveryEngine:
             if anomaly_type:
                 self.apply_recovery_strategy(anomaly_type, anomalies)
         
-        # Check for mode recovery
+        # Check for mode recovery; timer for RECOVERED -> NORMAL
         self.check_mode_recovery(telemetry)
-        
+        self.update_normal_transition(telemetry)
+
         # Apply recovery actions to telemetry
         modified_telemetry = self._apply_recovery_to_telemetry(telemetry)
         

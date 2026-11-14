@@ -104,6 +104,8 @@ class TelemetrySimulator:
 
         # Zeitpunkt des letzten Simulationsschritts
         self.last_simulation_time = 0.0
+        # Diskrete Simulationsuhr: volle Sekunden, unabhaengig von Wall-Clock-Jitter.
+        self.simulation_time_seconds = 0
 
         # Zuletzt generierte Telemetrie
         self.latest_telemetry = None
@@ -111,6 +113,7 @@ class TelemetrySimulator:
         self.current_mode = SatelliteMode.NORMAL
         self.fault_active = False
         self.fault_type = None
+        self.fault_end_time = None  # Simulationssekunden
         
         # Thermal state (for lag modeling)
         self.thermal_state = {
@@ -143,11 +146,8 @@ class TelemetrySimulator:
         
         
     def get_simulation_time(self):
-        # Vergangene reale Sekunden
-        elapsed_real = time.monotonic() - self.start_time
-
-        # Umrechnung in Simulationssekunden
-        return elapsed_real * self.simulation_speed
+        """Aktueller diskreter Simulationszeitpunkt in Sekunden (ganzzahlig)."""
+        return self.simulation_time_seconds
     
     def add_telemetry_callback(self, callback: Callable[[TelemetryData], None]):
         """Add a callback function to be called when new telemetry is generated"""
@@ -156,7 +156,7 @@ class TelemetrySimulator:
     def log_event(self, event_type: str, description: str, data: Optional[Dict] = None):
         """Log an event to the event timeline"""
         event = {
-            'timestamp': datetime.now(timezone.utc),
+            'timestamp': self.simulation_start + timedelta(seconds=self.get_simulation_time()),
             'type': event_type,
             'description': description,
             'data': data or {}
@@ -251,31 +251,39 @@ class TelemetrySimulator:
 
     
     def inject_fault(self, fault_type: str, duration: float = 60.0):
-        """
-        Inject a fault into the telemetry simulation.
-        
-        Args:
-            fault_type: Type of fault to inject
-            duration: Duration of fault in seconds
-        """
+        """Aktiviert einen Fehler fuer 'duration' Simulationssekunden."""
+        valid = {"LOW_VOLTAGE", "HIGH_TEMP", "RADIATION_SPIKE", "POWER_FAILURE"}
+        if fault_type not in valid:
+            raise ValueError(f"Unbekannter Fehlertyp: {fault_type}")
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("Fehlerdauer muss positiv und endlich sein")
+
+        now = self.get_simulation_time()
         self.fault_active = True
         self.fault_type = fault_type
-        self.log_event("FAULT_INJECTED", f"Fault injected: {fault_type}", 
-                      {"fault_type": fault_type, "duration": duration})
-        
-        # Schedule fault removal
-        asyncio.create_task(self._remove_fault_after_delay(duration))
-    
-    async def _remove_fault_after_delay(self, delay: float):
-        """Remove fault after specified delay"""
-        await asyncio.sleep(delay)
-        self.fault_active = False
-        self.fault_type = None
-        self.log_event("FAULT_REMOVED", "Injected fault removed")
-    
+        self.fault_end_time = now + duration
+        self.log_event(
+            "FAULT_INJECTED", f"Fault injected: {fault_type}",
+            {"fault_type": fault_type, "duration": duration,
+             "simulation_time": now, "fault_end_time": self.fault_end_time}
+        )
+
+    def update_fault_state(self):
+        """Beendet einen Fehler auf Basis der Simulationsuhr, ohne asyncio.sleep."""
+        if (self.fault_active and self.fault_end_time is not None
+                and self.get_simulation_time() >= self.fault_end_time):
+            former_type = self.fault_type
+            self.fault_active = False
+            self.fault_type = None
+            self.fault_end_time = None
+            self.log_event("FAULT_REMOVED", "Injected fault removed",
+                           {"fault_type": former_type})
+
     def generate_telemetry(self) -> TelemetryData:
-        """Generate a single telemetry data point"""
-        current_time = (self.simulation_start + timedelta(seconds=self.get_simulation_time()))
+        """Erzeuge genau einen neuen Telemetrieschritt von 1 Simulationssekunde."""
+        self.simulation_time_seconds += 1
+        self.update_fault_state()
+        current_time = self.simulation_start + timedelta(seconds=self.get_simulation_time())
         solar_factor = self.get_solar_irradiance_factor()
         is_sunlight = self.is_in_sunlight()
         
@@ -334,6 +342,12 @@ class TelemetrySimulator:
             target_obc_temp = random.uniform(10, 25)
             target_payload_temp = random.uniform(5, 20)
         
+        # HIGH_TEMP als anhaltende Waermestoerung modellieren.
+        # Kein Addieren auf den Zustand pro Update (sonst Aufschaukeln).
+        if self.fault_active and self.fault_type == "HIGH_TEMP":
+            target_battery_temp += 90.0
+            target_obc_temp += 100.0
+
         # Apply thermal lag
         target_temps = {
             'battery_temp_c': target_battery_temp,
@@ -365,11 +379,8 @@ class TelemetrySimulator:
             if self.fault_type == "LOW_VOLTAGE":
                 battery_voltage *= 0.7  # 30% voltage drop
                 battery_soc *= 0.6      # 40% SOC drop
-            elif self.fault_type == "HIGH_TEMP":
-                self.thermal_state['battery_temp_c'] += 20
-                self.thermal_state['obc_board_temp_c'] += 25
             elif self.fault_type == "RADIATION_SPIKE":
-                rad_cps = random.uniform(50, 100)
+                rad_cps = random.uniform(85, 100)  # sicher ueber 80-cps-Schwelle
             elif self.fault_type == "POWER_FAILURE":
                 battery_voltage *= 0.5
                 solar_array_power *= 0.3
@@ -469,44 +480,48 @@ def get_simulator() -> TelemetrySimulator:
 
 
 async def run_telemetry_stream(update_interval: float = 1.0):
-    """
-    Run the telemetry stream in the background.
-    
-    Args:
-        update_interval: Time between telemetry updates in seconds
+    """Ein Telemetrie-Datensatz pro EXAKTER Simulationssekunde.
+
+    Die echte Uhrzeit bestimmt nur, wie viele Schritte faellig sind.
+    Die physikalische Simulation arbeitet immer mit dt=1.0.
+    `update_interval` bleibt fuer die Kompatibilitaet erhalten, wird aber
+    bewusst ignoriert: Die Schrittweite ist stets 1 Simulationssekunde.
     """
     simulator = get_simulator()
-    
-    # Import recovery engine here to avoid circular imports
     from recovery import get_recovery_engine
     recovery_engine = get_recovery_engine(simulator)
-    
+
     while True:
-        try:
-            # Generate new telemetry
-            telemetry = simulator.generate_telemetry()
-            
-            # Process telemetry through recovery engine
-            telemetry = recovery_engine.process_telemetry(telemetry)
-            
-            # Update simulator's current mode to match recovery engine
-            simulator.current_mode = recovery_engine.current_mode
-            
-            # Aktuellsten verarbeiteten Telemetriedatensatz speichern
-            simulator.latest_telemetry = telemetry
-            
-            # Call all registered callbacks
-            for callback in simulator.telemetry_callbacks:
-                try:
-                    callback(telemetry)
-                except Exception as e:
-                    logger.error(f"Error in telemetry callback: {e}")
-            
-            await asyncio.sleep(update_interval)
-            
-        except Exception as e:
-            logger.error(f"Error in telemetry stream: {e}")
-            await asyncio.sleep(update_interval)
+        # Soll-Zeit aus monotoner Echtzeituhr: bei 60x nach ca. 1 realen
+        # Sekunde 60 vollstaendige Simulationsschritte.
+        elapsed_real = time.monotonic() - simulator.start_time
+        target_step = int(elapsed_real * simulator.simulation_speed)
+
+        # Auch bei Scheduling-Jitter werden die fehlenden Sekunden einzeln
+        # nachgerechnet; kein Sprung von z.B. t=10 direkt nach t=13.
+        if simulator.simulation_time_seconds < target_step:
+            try:
+                telemetry = simulator.generate_telemetry()
+                telemetry = recovery_engine.process_telemetry(telemetry)
+                simulator.current_mode = recovery_engine.current_mode
+                simulator.latest_telemetry = telemetry
+                for callback in simulator.telemetry_callbacks:
+                    try:
+                        callback(telemetry)
+                    except Exception as error:
+                        logger.error(f"Error in telemetry callback: {error}")
+            except Exception:
+                logger.exception("Error in telemetry stream")
+                # Der Schritt darf nicht stillschweigend verlorengehen.
+                # Fehler sichtbar machen und Stream beenden.
+                raise
+            # Eventloop auch bei einem Rueckstau nicht blockieren.
+            await asyncio.sleep(0)
+        else:
+            # Bis zum naechsten realen Zeitpunkt fuer den 1-s-Simulationsschritt.
+            next_step_real = (simulator.simulation_time_seconds + 1) / simulator.simulation_speed
+            wait_seconds = max(0.0, next_step_real - elapsed_real)
+            await asyncio.sleep(min(wait_seconds, 0.05))
 
 
 if __name__ == "__main__":
@@ -524,7 +539,7 @@ if __name__ == "__main__":
         simulator.add_telemetry_callback(print_telemetry)
         
         # Inject a test fault after 10 seconds
-        asyncio.create_task(simulator.inject_fault("LOW_VOLTAGE", 30.0))
+        simulator.inject_fault("LOW_VOLTAGE", 30.0)
         
         # Run the telemetry stream
         await run_telemetry_stream(1.0)

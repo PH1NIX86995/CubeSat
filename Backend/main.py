@@ -7,12 +7,16 @@ Provides REST API endpoints for telemetry data, satellite mode, and fault inject
 
 import asyncio
 import json
-from datetime import datetime, timezone
+import math
+import uuid
+from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 from telemetry import (
@@ -25,6 +29,47 @@ from telemetry import (
 
 # Global simulator instance
 simulator: Optional[TelemetrySimulator] = None
+
+
+class TelemetryBroadcast:
+    """Verteilt alle simulierten Samples und puffert sie fuer kurze Reconnects.
+
+    Stream-ID wechselt beim Backend-Neustart. Sequence ist pro Stream monoton.
+    Der Speicherpuffer ist begrenzt: kein Ersatz fuer eine persistente Server-DB.
+    """
+
+    def __init__(self, simulator: TelemetrySimulator, history_size: int = 100_000):
+        self.simulator = simulator
+        self.stream_id = uuid.uuid4().hex
+        self.sequence = 0
+        self.history = deque(maxlen=history_size)
+        self.subscribers = set()
+
+    def publish(self, sample: TelemetryData):
+        # Callback wird von der Asyncio-Simulationsschleife aufgerufen.
+        self.sequence += 1
+        message = {
+            "stream_id": self.stream_id,
+            "sequence": self.sequence,
+            "simulation_time_seconds": round(
+                (sample.timestamp - self.simulator.simulation_start).total_seconds(), 6
+            ),
+            "telemetry": jsonable_encoder(telemetry_to_dict(sample)),
+        }
+        self.history.append(message)
+
+        for queue in tuple(self.subscribers):
+            if queue.full():
+                # Keine stillschweigende Verwerfung: Verbindung soll neu starten.
+                self.subscribers.discard(queue)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait({"error": "consumer_too_slow"})
+            else:
+                queue.put_nowait(message)
+
+
+broadcast: Optional[TelemetryBroadcast] = None
 
 # Pydantic models for request/response
 class FaultInjectionRequest(BaseModel):
@@ -78,14 +123,19 @@ class ModeResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - start and stop background tasks"""
-    global simulator
+    global simulator, broadcast
     
     # Startup
     print("Starting SURAKSHASat telemetry simulator...")
     simulator = get_simulator()
+    broadcast = TelemetryBroadcast(simulator)
+    simulator.add_telemetry_callback(broadcast.publish)
     
     # Start the telemetry stream as a background task
-    telemetry_task = asyncio.create_task(run_telemetry_stream(1.0))
+    # Feste Schrittweite: jeder Tick entspricht genau 1 Simulationssekunde.
+    # Bei SIM_SPEED=60 werden ca. 60 einzelne Schritte pro realer Sekunde
+    # berechnet und ueber den WebSocket versendet.
+    telemetry_task = asyncio.create_task(run_telemetry_stream())
     
     print("Telemetry simulator started successfully!")
     
@@ -98,6 +148,12 @@ async def lifespan(app: FastAPI):
         await telemetry_task
     except asyncio.CancelledError:
         pass
+    if broadcast is not None:
+        try:
+            simulator.telemetry_callbacks.remove(broadcast.publish)
+        except ValueError:
+            pass
+    broadcast = None
     print("Telemetry simulator stopped.")
 
 # Create FastAPI app with lifespan management
@@ -162,6 +218,49 @@ async def root():
         }
     }
 
+@app.websocket("/telemetry/stream")
+async def telemetry_stream(websocket: WebSocket):
+    """Live-Stream inkl. kurzer Wiederaufnahme ueber ?stream_id=...&since=..."""
+    await websocket.accept()
+    hub = broadcast
+    if hub is None:
+        await websocket.close(code=1013, reason="Simulator not ready")
+        return
+
+    try:
+        since = max(0, int(websocket.query_params.get("since", "0")))
+    except ValueError:
+        await websocket.close(code=1008, reason="Invalid since")
+        return
+
+    requested_stream_id = websocket.query_params.get("stream_id")
+    queue = asyncio.Queue(maxsize=2000)
+    # Ab hier synchron ausfuehren, damit zwischen Snapshot und Registrierung
+    # kein Simulationssample verloren gehen kann.
+    hub.subscribers.add(queue)
+    if requested_stream_id == hub.stream_id:
+        replay = [msg for msg in hub.history if msg["sequence"] > since]
+    else:
+        # Bei erstem Connect alle noch gepufferten Daten uebertragen.
+        replay = list(hub.history)
+
+    try:
+        for message in replay:
+            await websocket.send_json(message)
+        while True:
+            message = await queue.get()
+            if "error" in message:
+                await websocket.close(code=1013, reason="Consumer too slow")
+                break
+            # Zwischen Replay und Live-Daten koennen Duplikate entstehen.
+            # Collector verarbeitet Sequenznummern idempotent.
+            await websocket.send_json(message)
+    except (WebSocketDisconnect, RuntimeError, OSError):
+        pass
+    finally:
+        hub.subscribers.discard(queue)
+
+
 @app.get("/telemetry/latest", response_model=TelemetryResponse)
 async def get_latest_telemetry():
     """
@@ -170,7 +269,10 @@ async def get_latest_telemetry():
     Returns complete telemetry data including all power, thermal, and radiation parameters.
     """
     sim = get_simulator_instance()
-    telemetry = sim.get_latest_telemetry()
+    try:
+        telemetry = sim.get_latest_telemetry()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     return TelemetryResponse(**telemetry_to_dict(telemetry))
 
 @app.get("/telemetry/logs", response_model=List[EventLogResponse])
@@ -217,8 +319,11 @@ async def get_downlink_data():
     Returns telemetry data filtered based on current satellite mode.
     """
     sim = get_simulator_instance()
-    telemetry = sim.get_latest_telemetry()
-    
+    try:
+        telemetry = sim.get_latest_telemetry()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
     if sim.current_mode == SatelliteMode.NORMAL:
         # Return all telemetry data
         return telemetry_to_dict(telemetry)
@@ -256,7 +361,7 @@ async def inject_fault(request: FaultInjectionRequest):
         )
     
     # Validate duration
-    if request.duration <= 0 or request.duration > 3600:  # Max 1 hour
+    if not math.isfinite(request.duration) or request.duration <= 0 or request.duration > 3600:  # Max 1 hour
         raise HTTPException(
             status_code=400,
             detail="Duration must be between 0 and 3600 seconds"
@@ -265,8 +370,11 @@ async def inject_fault(request: FaultInjectionRequest):
     # Inject the fault
     sim.inject_fault(request.type, request.duration)
     
-    # Get updated telemetry
-    telemetry = sim.get_latest_telemetry()
+    # Liefert das letzte Sample. Der Fault wirkt ab dem naechsten Simulationstick.
+    try:
+        telemetry = sim.get_latest_telemetry()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     
     return FaultInjectionResponse(
         message=f"Fault '{request.type}' injected for {request.duration} seconds",
@@ -323,6 +431,25 @@ async def health_check():
         "current_mode": sim.current_mode.value if sim else "unknown",
         "timestamp": datetime.now(timezone.utc)
     }
+
+
+@app.get("/simulation/status")
+async def get_simulation_status():
+    """Uhr, Speed und Orbitstatus fuer Tests und Digital Twin."""
+    sim = get_simulator_instance()
+    seconds = sim.get_simulation_time()
+    return {
+        "simulation_speed": sim.simulation_speed,
+        "simulation_time_seconds": round(seconds, 3),
+        "simulation_timestamp": (sim.simulation_start + timedelta(seconds=seconds)).isoformat(),
+        "orbital_phase": sim.get_orbital_phase(),
+        "orbital_period_seconds": sim.orbital_period,
+        "in_sunlight": sim.is_in_sunlight(),
+        "fault_active": sim.fault_active,
+        "fault_type": sim.fault_type,
+        "fault_end_time": sim.fault_end_time,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
